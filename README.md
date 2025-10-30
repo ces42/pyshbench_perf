@@ -1,22 +1,8 @@
 # pyshbench
-A benchmarking tool for the stockfish chess engine implemented in python
+This is a modified version of [hazzl/pyshbench](https://github.com/hazzl/pyshbench/), a benchmarking tool for the stockfish chess engine implemented in python.
 
-##running
-`pyshbench` requires three arguments:
-  - path to baseline
-  - path to testcase
-  - number of test runs for each
+**NOTE:** you will probably need to edit the cpuset variable to use this on your computer
 
-For example:  
-```
-$ pyshbench ~/base ~/test 30
-~/test 30: 1388520
-Result of  30 runs
-Base nps:  1389093.28  stdev:  6041.287972690889
-Test nps:  1382020.68  stdev:  6682.202674970863
-Speed-up:  -0.5118%
-p-value:   0.224
-```
+The `pyshbench_perf` script operates like `pyshbench` but measures clock cycles instead of elapsed time. Consequently, it is insensitive to changing clock speeds, and thus much more precise. However, some cpus can only execute certain instructions (AVX2, AVX512) at lower clock speeds. So `pyshbench_perf` might not be helpful if one of the versions you are comparing uses more vectorized instructions that the other.
 
-##To Do
-  - run tasks sequentially when there is just one physical core 
+
