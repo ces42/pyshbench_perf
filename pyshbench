@@ -30,17 +30,32 @@ def rightstr(s, l):
 	else:
 		return s
 
-if (len(sys.argv) != 4 or int(sys.argv[3]) < 2):
-	exit("Usage:\n" + sys.argv[0] + " base test #runs\nwhere #runs >= 2")
+def stats(base, test, diff):
+    runs = len(base)
+    assert len(test) == runs == len(diff)
+    assert runs >= 2
+    base_mean = statistics.mean(base)
+    test_mean = statistics.mean(test)
+    diff_mean = test_mean - base_mean
+    base_sdev = statistics.stdev(base, base_mean) / math.sqrt(runs)
+    test_sdev = statistics.stdev(test, test_mean) / math.sqrt(runs)
+    diff_sdev = statistics.stdev(diff, diff_mean) / math.sqrt(runs)
+    return (base_mean, base_sdev), (test_mean, test_sdev), (diff_mean, diff_sdev)
+
+if (len(sys.argv) not in {4, 5} or int(sys.argv[3]) < 2):
+	exit("Usage:\n" + sys.argv[0] + " base test #runs [depth] \nwhere #runs >= 2")
 
 base, test, diff = [], [], []
 runs = int(sys.argv[3])
+depth = int(sys.argv[4]) if len(sys.argv) >= 5 else 13
+
 exp = re.compile(br"Nodes/second\s*: (\d+)")
 
 # determine CPU sets to run on
 # this assumes that logical cpus on the same core are numbered sequentially
 num_cores = psutil.cpu_count(logical=False)
 num_cpus = psutil.cpu_count()
+
 cpu_step = int(num_cpus / num_cores)
 cpuset = []
 cpuset.append(list())
@@ -48,35 +63,90 @@ cpuset.append(list())
 for i in range(0, cpu_step):
 	cpuset[0].extend(list(range(i, num_cpus, cpu_step*2)))
 	cpuset[1].extend(list(range(i+cpu_step, num_cpus, cpu_step*2)))
+
+cpuset = [[10, 11], [8, 9]]
 print("{:>3} {:>10} {:>10} {:>8}".format("run","base","test","diff"))
 
-for i in range(runs):
-	# Start both processes. This is non-blocking.
-	base_process = subprocess.Popen([sys.argv[1],"bench"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-	psutil.Process(base_process.pid).cpu_affinity(cpuset[i%2])
-	test_process = subprocess.Popen([sys.argv[2],"bench"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-	psutil.Process(test_process.pid).cpu_affinity(cpuset[(i+1)%2])
+GREEN = "\033[32m"
+RED = "\033[31m"
+RESET = "\033[0m"
 
-	# Wait for processes to finish and grep nps results in their stderr output
-	base.append(int(exp.search(base_process.stderr.read()).group(1)))
-	test.append(int(exp.search(test_process.stderr.read()).group(1)))
+hash = int(16 * 2**(max(0, (depth - 13) / 2)))
 
-	diff.append(test[i] - base[i])
-	print("{:>3} {:>10n} {:>10n} {:>+8n}".format (i + 1, base[i], test[i], diff[i]))
+# cmd = f"bench {hash} 1 {depth}"
+cmd = f"speedtest 1 16 50"
 
-base_mean = statistics.mean(base)
-test_mean = statistics.mean(test)
-diff_mean = statistics.mean(diff)
+print(f'command: {cmd}')
 
-base_sdev = statistics.stdev(base, base_mean) / math.sqrt(runs)
-test_sdev = statistics.stdev(test, test_mean) / math.sqrt(runs)
-diff_sdev = statistics.stdev(diff, diff_mean) / math.sqrt(runs)
+i = 0
+try:
+	for i in range(runs):
+		if i > 1:
+			(base_mean, base_sdev), \
+			(test_mean, test_sdev), \
+			(diff_mean, diff_sdev) = stats(base, test, diff)
+			print(f"mean{int(base_mean + .5):>10n} {int(test_mean + .5):>10n} "
+				  + (GREEN if diff_mean > 0 else RED) * (abs(diff_mean) > 2*diff_sdev) +
+				  f"{int(diff_mean + .5):>8n}{RESET} +- {int(diff_sdev + .5)}",
+				  end='', flush=True)
+		# Start both processes. This is non-blocking.
+		base_process = subprocess.Popen([sys.argv[1], cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+		psutil.Process(base_process.pid).cpu_affinity(cpuset[i%2])
+		test_process = subprocess.Popen([sys.argv[2], cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+		psutil.Process(test_process.pid).cpu_affinity(cpuset[(i+1)%2])
+
+		# Wait for processes to finish and grep nps results in their stderr output
+		base.append(int(exp.search(base_process.stderr.read()).group(1)))
+		test.append(int(exp.search(test_process.stderr.read()).group(1)))
+
+		diff.append(test[i] - base[i])
+		print("\r" + " " * 45 + "\r", end='') # clear previous line
+		print(f"{i+1:>3} {base[i]:>10n} {test[i]:>10n} {RED if diff[i] < 0 else GREEN}{diff[i]:>+8n}" + RESET)
+except KeyboardInterrupt:
+	runs = i
+	if i < 2 or not len(base) == len(test) == len(diff) == runs:
+		raise
+
+(base_mean, base_sdev), (test_mean, test_sdev), (diff_mean, diff_sdev) = stats(base, test, diff)
+
+try:
+    from scipy.stats import t
+    CDF = t(runs - 1).cdf
+    Quantile = t(runs - 1).ppf
+    comment = "[95% CI; t-statistic]"
+except ImportError:
+    t = None
+    comment = "[95% CI]"
+
+if len(diff) > 2 and len(diff) % 2 == 0:
+    n = len(diff) / 2
+    diff1_sdev = statistics.stdev(diff[::2]) / math.sqrt(n)
+    diff2_sdev = statistics.stdev(diff[1::2]) / math.sqrt(n)
+    diff_sdev = math.sqrt(diff1_sdev**2 + diff2_sdev**2) / 2
+    # sdev2_ = statistics.stdev([(x+y)/2 for x, y in zip(diff[::2], diff[1::2])]) / math.sqrt(len(diff) / 2)
+    if t is not None:
+        CDF = t(runs - 2).cdf
+        Quantile = t(runs - 2).ppf
+
 print("\nResult of {:3n} runs\n==================".format(runs))
 print("base ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[1],15), round(base_mean), round(Quantile(0.975) * base_sdev)))
 print("test ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[2],15), round(test_mean), round(Quantile(0.975) * test_sdev)))
 print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
-print("\nspeedup        = {:>+6.4f}".format(diff_mean / base_mean))
-print("P(speedup > 0) = {:>7.4f}".format(CDF(diff_mean / diff_sdev)))
+
+speedup = diff_mean / base_mean
+sp_unc = math.sqrt( diff_sdev**2 + (base_sdev * speedup)**2 ) / base_mean
+# the qutoient of t-distributed RVs is not exactly t-distributed, but in practice
+# the variance in sp_unc is going to be completely dominated by the variance in
+# diff_mean we can ignore this (and really we could kip the calculation above
+# and just approximate sp_unc = diff_sdev)
+
+print(f"speedup %              =   {100 * diff_mean / base_mean:>+8.2f}  +/- {100 * sp_unc * Quantile(0.975):.2f}")
+print(" " * 25 + comment)
+print()
+
+print(f"p(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
+# this number is basically p-value. If there is not speedup, the probability of this saying p(...) > 1 - p is less than p
+print(f"p(speedup > .5%) = {CDF((speedup - .005) / sp_unc):>7.4f}")
 
 cpu = str()
 if os.path.exists("/proc/cpuinfo"):
