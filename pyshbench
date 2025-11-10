@@ -36,7 +36,7 @@ def stats(base, test, diff):
     assert runs >= 2
     base_mean = statistics.mean(base)
     test_mean = statistics.mean(test)
-    diff_mean = test_mean - base_mean
+    diff_mean = statistics.mean(diff)
     base_sdev = statistics.stdev(base, base_mean) / math.sqrt(runs)
     test_sdev = statistics.stdev(test, test_mean) / math.sqrt(runs)
     diff_sdev = statistics.stdev(diff, diff_mean) / math.sqrt(runs)
@@ -87,7 +87,7 @@ try:
 			(diff_mean, diff_sdev) = stats(base, test, diff)
 			print(f"mean{int(base_mean + .5):>10n} {int(test_mean + .5):>10n} "
 				  + (GREEN if diff_mean > 0 else RED) * (abs(diff_mean) > 2*diff_sdev) +
-				  f"{int(diff_mean + .5):>8n}{RESET} +- {int(diff_sdev + .5)}",
+				f"{100 * diff_mean:>+7.2f}{RESET} +- {diff_sdev:.2%}",
 				  end='', flush=True)
 		# Start both processes. This is non-blocking.
 		base_process = subprocess.Popen([sys.argv[1], cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -99,7 +99,7 @@ try:
 		base.append(int(exp.search(base_process.stderr.read()).group(1)))
 		test.append(int(exp.search(test_process.stderr.read()).group(1)))
 
-		diff.append(test[i] - base[i])
+		diff.append(test[i] / base[i] - 1)
 		print("\r" + " " * 45 + "\r", end='') # clear previous line
 		print(f"{i+1:>3} {base[i]:>10n} {test[i]:>10n} {RED if diff[i] < 0 else GREEN}{diff[i]:>+8n}" + RESET)
 except KeyboardInterrupt:
@@ -131,22 +131,16 @@ if len(diff) > 2 and len(diff) % 2 == 0:
 print("\nResult of {:3n} runs\n==================".format(runs))
 print("base ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[1],15), round(base_mean), round(Quantile(0.975) * base_sdev)))
 print("test ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[2],15), round(test_mean), round(Quantile(0.975) * test_sdev)))
-print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
+# print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
 
-speedup = diff_mean / base_mean
-sp_unc = math.sqrt( diff_sdev**2 + (base_sdev * speedup)**2 ) / base_mean
-# the qutoient of t-distributed RVs is not exactly t-distributed, but in practice
-# the variance in sp_unc is going to be completely dominated by the variance in
-# diff_mean we can ignore this (and really we could kip the calculation above
-# and just approximate sp_unc = diff_sdev)
-
-print(f"speedup %              =   {100 * diff_mean / base_mean:>+8.2f}  +/- {100 * sp_unc * Quantile(0.975):.2f}")
+print(f"speedup %              =   {100 * diff_mean:>+8.2f}  +/- {100 * diff_sdev * Quantile(0.975):.2f}")
 print(" " * 25 + comment)
 print()
 
 print(f"p(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
 # this number is basically p-value. If there is not speedup, the probability of this saying p(...) > 1 - p is less than p
-print(f"p(speedup > .5%) = {CDF((speedup - .005) / sp_unc):>7.4f}")
+if p05 := CDF((diff_mean - .005) / diff_sdev) > 0.01:
+	print(f"p(speedup > .5%) = {p05}")
 
 cpu = str()
 if os.path.exists("/proc/cpuinfo"):
