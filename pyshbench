@@ -100,8 +100,19 @@ try:
         test.append(int(exp.search(test_process.stderr.read()).group(1)))
 
         diff.append(test[i] / base[i] - 1)
-        print("\r" + " " * 45 + "\r", end='') # clear previous line
-        print(f"{i+1:>3} {base[i]:>10n} {test[i]:>10n} {RED if diff[i] < 0 else GREEN}{diff[i]:>+8n}" + RESET)
+        print("\r" + " " * 45, end='') # clear previous line
+        def format_diff(num):
+            COLOR = (RED, GREEN)
+            sign = num >= 0
+            s = f'{num:>+7.1%}'
+            if abs(num) > .0025:
+                return COLOR[sign] + s + RESET
+            elif abs(num) > .001:
+                digits = len(f'{num:.1%}')
+                return COLOR[sign] + s[:-digits] + RESET + s[-digits:]
+            else:
+                return s
+        print(f"\r{i+1:>3} {base[i]:>10n} {test[i]:>10n} {format_diff(diff[i])}" + RESET)
 except KeyboardInterrupt:
     runs = i
     if i < 2 or not len(base) == len(test) == len(diff) == runs:
