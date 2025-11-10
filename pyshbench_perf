@@ -41,7 +41,7 @@ def stats(base, test, diff):
     assert runs >= 2
     base_mean = statistics.mean(base)
     test_mean = statistics.mean(test)
-    diff_mean = test_mean - base_mean
+    diff_mean = statistics.mean(diff)
     base_sdev = statistics.stdev(base, base_mean) / math.sqrt(runs)
     test_sdev = statistics.stdev(test, test_mean) / math.sqrt(runs)
     diff_sdev = statistics.stdev(diff, diff_mean) / math.sqrt(runs)
@@ -83,7 +83,7 @@ num_cpus = psutil.cpu_count()
 # [1, 2] > [3, 4]
 # [0, 5] ~~ [3, 4]
 cpuset = [[10, 11], [8, 9]]
-print("{:>3} {:>10} {:>10} {:>8}".format("run","base","test","diff"))
+print("{:>3} {:>10} {:>10} {:>6}".format("run","base","test","diff"))
 
 
 if not spd_nodes:
@@ -116,7 +116,7 @@ try:
             (diff_mean, diff_sdev) = stats(base, test, diff)
             print(f"mean{int(base_mean + .5):>10n} {int(test_mean + .5):>10n} "
                   + (GREEN if diff_mean > 0 else RED) * (abs(diff_mean) > 2*diff_sdev) +
-                  f"{int(diff_mean + .5):>8n}{RESET} +- {int(diff_sdev + .5)}",
+                f"{100 * diff_mean:>+7.2f}{RESET} +- {diff_sdev:.2%}",
                   end='', flush=True)
 
         # Start both processes. This is non-blocking.
@@ -140,12 +140,11 @@ try:
                     pending.remove(f)
 
 
-        base_perf = subprocess.Popen(["perf", "stat", '-p', str(base_proc.pid)],
-                                     stderr=subprocess.PIPE,
-                                     encoding='utf8')
-        test_perf = subprocess.Popen(["perf", "stat", '-p', str(test_proc.pid)],
-                                     stderr=subprocess.PIPE,
-                                     encoding='utf8')
+        perfs = [
+            subprocess.Popen(["perf", "stat", '-p', str(proc.pid)],
+                             stderr=subprocess.PIPE, encoding='utf8')
+            for proc in (base_proc, test_proc)
+        ]
 
         # run bench
         base_proc.stdin.write(cmd + '\nquit\n')
@@ -162,12 +161,12 @@ try:
             print("WARN:  signature differs")
             warned = True
 
-        for p, stat, nd in zip((base_perf, test_perf), (base, test), nodes):
+        for p, stat, nd in zip(perfs, (base, test), nodes):
             p.send_signal(2)  # make perf print its output
             cycles = parse_cycles(p.stderr.read())
             stat.append(int(nd / cycles * 1e9))
 
-        diff.append(test[runs] - base[runs])
+        diff.append(test[runs] / base[runs] - 1)
         if spd_nodes and runs == 0:
             for name, out in (('base', stats_b), ('test', stats_t)):
                 start = out.find('TT size [MiB]')
@@ -177,18 +176,18 @@ try:
 
 
         print("\r" + " " * 45, end='') # clear previous line
-        def apply_color(num):
+        def format_diff(num):
             COLOR = (RED, GREEN)
             sign = num >= 0
-            s = f'{num:>+8n}'
-            if abs(num) > .0025 * base[runs]:
+            s = f'{num:>+7.1%}'
+            if abs(num) > .0025:
                 return COLOR[sign] + s + RESET
-            elif abs(num) > .001 * base[runs]:
-                digits = len(str(abs(num)))
+            elif abs(num) > .001:
+                digits = len(f'{num:.1%}')
                 return COLOR[sign] + s[:-digits] + RESET + s[-digits:]
             else:
                 return s
-        print(f"\r{runs+1:>3} {base[runs]:>10n} {test[runs]:>10n} {apply_color(diff[runs])}" + RESET)
+        print(f"\r{runs+1:>3} {base[runs]:>10n} {test[runs]:>10n} {format_diff(diff[runs])}" + RESET)
     else:
         runs += 1
 except KeyboardInterrupt:
@@ -219,22 +218,15 @@ if len(diff) % 2 == 0:
 print("\nResult of {:3n} runs\n==================".format(runs))
 print("base ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[1],15), round(base_mean), round(Quantile(0.975) * base_sdev)))
 print("test ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[2],15), round(test_mean), round(Quantile(0.975) * test_sdev)))
-print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
+# print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
 
-speedup = diff_mean / base_mean
-sp_unc = math.sqrt( diff_sdev**2 + (base_sdev * speedup)**2 ) / base_mean
-# the qutoient of t-distributed RVs is not exactly t-distributed, but in practice
-# the variance in sp_unc is going to be completely dominated by the variance in
-# diff_mean we can ignore this (and really we could kip the calculation above
-# and just approximate sp_unc = diff_sdev)
-
-print(f"speedup %              =   {100 * diff_mean / base_mean:>+8.2f}  +/- {100 * sp_unc * Quantile(0.975):.2f}")
+print(f"speedup %              =   {100 * diff_mean:>+8.2f}  +/- {100 * diff_sdev * Quantile(0.975):.2f}")
 print(" " * 25 + comment)
 print()
 
 print(f"p(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
 # this number is basically p-value. If there is not speedup, the probability of this saying p(...) > 1 - p is less than p
-print(f"p(speedup > .5%) = {CDF((speedup - .005) / sp_unc):>7.4f}")
+print(f"p(speedup > .5%) = {CDF((diff_mean - .005) / diff_sdev):>7.4f}")
 
 cpu = str()
 if os.path.exists("/proc/cpuinfo"):
