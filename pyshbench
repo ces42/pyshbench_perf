@@ -73,10 +73,19 @@ RESET = "\033[0m"
 
 hash = int(16 * 2**(max(0, (depth - 13) / 2)))
 
-# cmd = f"bench {hash} 1 {depth}"
-cmd = f"speedtest 1 16 50"
+cmd = f"bench {hash} 1 {depth}"
+# cmd = f"speedtest 1 16 50"
 
 print(f'command: {cmd}')
+
+def and_affinity(pid, cpuset):
+    proc = psutil.Process(pid)
+    proc.cpu_affinity(set(cpuset) & set(proc.cpu_affinity()))
+
+def start_engine(path, affinity):
+    proc = subprocess.Popen([path, cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    and_affinity(proc.pid, affinity)
+    return proc
 
 i = 0
 try:
@@ -89,11 +98,14 @@ try:
                   + (GREEN if diff_mean > 0 else RED) * (abs(diff_mean) > 2*diff_sdev) +
                 f"{100 * diff_mean:>+7.2f}{RESET} +- {diff_sdev:.2%}",
                   end='', flush=True)
+
         # Start both processes. This is non-blocking.
-        base_process = subprocess.Popen([sys.argv[1], cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        psutil.Process(base_process.pid).cpu_affinity(cpuset[i%2])
-        test_process = subprocess.Popen([sys.argv[2], cmd], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        psutil.Process(test_process.pid).cpu_affinity(cpuset[(i+1)%2])
+        if i % 2 == 0:
+            base_process = start_engine(sys.argv[1], cpuset[i%2])
+            test_process = start_engine(sys.argv[2], cpuset[(i + 1)%2])
+        else:
+            test_process = start_engine(sys.argv[2], cpuset[(i + 1)%2])
+            base_process = start_engine(sys.argv[1], cpuset[i%2])
 
         # Wait for processes to finish and grep nps results in their stderr output
         base.append(int(exp.search(base_process.stderr.read()).group(1)))
@@ -150,7 +162,7 @@ print()
 
 print(f"p(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
 # this number is basically p-value. If there is not speedup, the probability of this saying p(...) > 1 - p is less than p
-if p05 := CDF((diff_mean - .005) / diff_sdev) > 0.01:
+if (p05 := CDF((diff_mean - .005) / diff_sdev)) > 0.01:
     print(f"p(speedup > .5%) = {p05}")
 
 cpu = str()
