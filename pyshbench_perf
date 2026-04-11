@@ -47,8 +47,8 @@ def stats(base, test, diff):
     diff_sdev = statistics.stdev(diff, diff_mean) / math.sqrt(runs)
     return (base_mean, base_sdev), (test_mean, test_sdev), (diff_mean, diff_sdev)
 
-RE_CYCLES = re.compile(r"([0-9,]*)\s+cpu_core/cycles")
-RE_NODES = re.compile(r"Nodes searched\s*: (\d+)")
+RE_CYCLES = re.compile(r"([0-9,]*)\s+cpu_core/cpu-cycles")
+RE_NODES = re.compile(r"^Nodes searched\s*: (\d+)", re.MULTILINE)
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -90,7 +90,9 @@ if not spd_nodes:
     hash = int(16 * 2**(max(0, (depth - 13) / 2)))
     cmd = f"bench {hash} 1 {depth}"
 elif spd_nodes == 'stc':
-    cmd = f"speedtest 1 16 75 nodestime"
+    # cmd = f"speedtest 1 16 75 nodestime"
+    cmd = f"speedtest 1 16 50"
+    # cmd = f"speedtest 1 8 25"
 elif spd_nodes == 'ltc':
     cmd = f"speedtest 1 64 450 nodestime"
 else:
@@ -105,12 +107,15 @@ def start_engine(path):
         encoding="utf8"
     )
 
+def and_affinity(pid, cpuset):
+    proc = psutil.Process(pid)
+    proc.cpu_affinity(set(cpuset) & set(proc.cpu_affinity()))
+
 warned = False
-todo = range(runs)
+sample_no = 0
 try:
-    t = perf_counter()
-    for runs in todo:
-        if runs > 1:
+    while sample_no < runs:
+        if sample_no > 1:
             (base_mean, base_sdev), \
             (test_mean, test_sdev), \
             (diff_mean, diff_sdev) = stats(base, test, diff)
@@ -121,13 +126,13 @@ try:
 
         # Start both processes. This is non-blocking.
         base_proc = start_engine(sys.argv[1])
-        psutil.Process(base_proc.pid).cpu_affinity(cpuset[runs%2])
+        and_affinity(base_proc.pid, cpuset[sample_no % 2])
 
         test_proc = start_engine(sys.argv[2])
-        psutil.Process(test_proc.pid).cpu_affinity(cpuset[(runs+1)%2])
+        and_affinity(test_proc.pid, cpuset[(sample_no + 1) % 2])
 
         # send uci and wait for each engine to reply "uciok"
-        for p in (base_proc, test_proc):
+        for p in (base_proc, test_proc)[:: (-1)**( sample_no%4 in {0, 3} )]:
             p.stdin.write("uci\n")
             p.stdin.flush()
 
@@ -138,6 +143,7 @@ try:
                 line = f.readline() # it seems like readline() is ok, but readlines() is not
                 if line.startswith('id name'):
                     pending.remove(f)
+            sleep(0.001)
 
 
         perfs = [
@@ -145,35 +151,48 @@ try:
                              stderr=subprocess.PIPE, encoding='utf8')
             for proc in (base_proc, test_proc)
         ]
+        sleep(0.3)
+
+        def start(proc):
+            proc.stdin.write(cmd + '\nquit\n')
+            proc.stdin.flush()
 
         # run bench
-        base_proc.stdin.write(cmd + '\nquit\n')
-        test_proc.stdin.write(cmd + '\nquit\n')
-        base_proc.stdin.flush()
-        test_proc.stdin.flush()
+        # then wait for processes to finish ...
+        if sample_no % 4 in {0, 1}:
+            start(test_proc)
+            start(base_proc)
+            # whichever process comes second here is falsely shown to have higher nodes per cycle, which is why we need to alternate
+            _, out_t = test_proc.communicate()
+            _, out_b = base_proc.communicate()
+        else:
+            start(base_proc)
+            start(test_proc)
+            _, out_b = base_proc.communicate()
+            _, out_t = test_proc.communicate()
 
-        # Wait for processes to finish and grep nps results in their stderr output
-        _, out_b = base_proc.communicate()
-        _, out_t = test_proc.communicate()
 
+        # ... and grep nps results in their stderr output
         nodes = [int(RE_NODES.search(out).group(1)) for out in (out_b, out_t)]
+        if nodes[1] == 0:
+            nodes[1] = nodes[0]
         if not warned and nodes[0] != nodes[1]:
             print("WARN:  signature differs")
             warned = True
 
-        for p, stat, nd in zip(perfs, (base, test), nodes):
+        for p, stat, nd in list(zip(perfs, (base, test), nodes)):
             p.send_signal(2)  # make perf print its output
-            cycles = parse_cycles(p.stderr.read())
+            perf = p.stderr.read()
+            cycles = parse_cycles(perf)
             stat.append(int(nd / cycles * 1e9))
 
-        diff.append(test[runs] / base[runs] - 1)
-        if spd_nodes and runs == 0:
-            for name, out in (('base', stats_b), ('test', stats_t)):
-                start = out.find('TT size [MiB]')
-                lines = out[start:].split('\n')
-                print(f'output from {name}:')
-                print('\n'.join('  ' + x for x in lines[:6]))
-
+        diff.append(math.log(test[sample_no] / base[sample_no]))
+        # if spd_nodes and sample_no == 0:
+        #     for name, out in (('base', stats_b), ('test', stats_t)):
+        #         start = out.find('TT size [MiB]')
+        #         lines = out[start:].split('\n')
+        #         print(f'output from {name}:')
+        #         print('\n'.join('  ' + x for x in lines[:6]))
 
         print("\r" + " " * 45, end='') # clear previous line
         def format_diff(num):
@@ -187,46 +206,56 @@ try:
                 return COLOR[sign] + s[:-digits] + RESET + s[-digits:]
             else:
                 return s
-        print(f"\r{runs+1:>3} {base[runs]:>10n} {test[runs]:>10n} {format_diff(diff[runs])}" + RESET)
-    else:
-        runs += 1
+        print(f"\r{sample_no+1:>3} {base[sample_no]:>10n} {test[sample_no]:>10n} {format_diff(diff[sample_no])}" + RESET)
+        if abs(diff[-1]) > math.log(2):
+            print('  ^^^^ discarding this ^^^^')
+            diff = diff[:-1]
+            base = base[:-1]
+            test = test[:-1]
+            continue
+        sample_no += 1
 except KeyboardInterrupt:
     print("\r" + " " * 345, end='') # clear previous line
-    if runs < 2 or not len(base) == len(test) == len(diff) == runs:
+    if sample_no < 2 or not len(base) == len(test) == len(diff) == sample_no:
         raise
 
 (base_mean, base_sdev), (test_mean, test_sdev), (diff_mean, diff_sdev) = stats(base, test, diff)
 try:
     from scipy.stats import t
-    CDF = t(runs - 1).cdf
-    Quantile = t(runs - 1).ppf
+    CDF = t(sample_no - 1).cdf
+    Quantile = t(sample_no - 1).ppf
     comment = "[95% CI; t-statistic]"
 except ImportError:
     t = None
     comment = "[95% CI]"
 
-if len(diff) % 2 == 0:
+if len(diff) > 2 and len(diff) % 2 == 0:
     n = len(diff) / 2
     diff1_sdev = statistics.stdev(diff[::2]) / math.sqrt(n)
     diff2_sdev = statistics.stdev(diff[1::2]) / math.sqrt(n)
     diff_sdev = math.sqrt(diff1_sdev**2 + diff2_sdev**2) / 2
     # sdev2_ = statistics.stdev([(x+y)/2 for x, y in zip(diff[::2], diff[1::2])]) / math.sqrt(len(diff) / 2)
     if t is not None:
-        CDF = t(runs - 2).cdf
-        Quantile = t(runs - 2).ppf
+        CDF = t(sample_no - 2).cdf
+        Quantile = t(sample_no - 2).ppf
 
-print("\nResult of {:3n} runs\n==================".format(runs))
+n = "hi"
+
+print(f"\nResult of {sample_no} runs (cycles)\n===========================")
 print("base ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[1],15), round(base_mean), round(Quantile(0.975) * base_sdev)))
 print("test ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[2],15), round(test_mean), round(Quantile(0.975) * test_sdev)))
 # print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
 
-print(f"speedup %              =   {100 * diff_mean:>+8.2f}  +/- {100 * diff_sdev * Quantile(0.975):.2f}")
+speedup = math.exp(diff_mean) - 1
+sp_unc = math.exp(diff_mean) * diff_sdev
+print(f"speedup %              =   {100 * speedup:>+8.2f}  +/- {100 * sp_unc * Quantile(0.975):.2f}")
 print(" " * 25 + comment)
 print()
 
 print(f"p(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
 # this number is basically p-value. If there is not speedup, the probability of this saying p(...) > 1 - p is less than p
-print(f"p(speedup > .5%) = {CDF((diff_mean - .005) / diff_sdev):>7.4f}")
+if (p05 := CDF((diff_mean - math.log(1.005)) / diff_sdev)) > 0.01 or speedup > 1.025:
+    print(f"p(speedup > .5%) = {p05:>7.4f}")
 
 cpu = str()
 if os.path.exists("/proc/cpuinfo"):
