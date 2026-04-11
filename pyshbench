@@ -100,7 +100,7 @@ try:
                   end='', flush=True)
 
         # Start both processes. This is non-blocking.
-        if i % 2 == 0:
+        if i % 4 in {0, 3}:
             base_process = start_engine(sys.argv[1], cpuset[i%2])
             test_process = start_engine(sys.argv[2], cpuset[(i + 1)%2])
         else:
@@ -111,7 +111,7 @@ try:
         base.append(int(exp.search(base_process.stderr.read()).group(1)))
         test.append(int(exp.search(test_process.stderr.read()).group(1)))
 
-        diff.append(test[i] / base[i] - 1)
+        diff.append(math.log(test[i] / base[i]))
         print("\r" + " " * 45, end='') # clear previous line
         def format_diff(num):
             COLOR = (RED, GREEN)
@@ -156,14 +156,16 @@ print("base ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[1],15), roun
 print("test ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[2],15), round(test_mean), round(Quantile(0.975) * test_sdev)))
 # print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
 
-print(f"speedup %              =   {100 * diff_mean:>+8.2f}  +/- {100 * diff_sdev * Quantile(0.975):.2f}")
+speedup = math.exp(diff_mean) - 1
+sp_unc = math.exp(diff_mean) * diff_sdev
+print(f"speedup %              =   {100 * speedup:>+8.2f}  +/- {100 * sp_unc * Quantile(0.975):.2f}")
 print(" " * 25 + comment)
 print()
 
 print(f"p(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
 # this number is basically p-value. If there is not speedup, the probability of this saying p(...) > 1 - p is less than p
-if (p05 := CDF((diff_mean - .005) / diff_sdev)) > 0.01:
-    print(f"p(speedup > .5%) = {p05}")
+if (p05 := CDF((diff_mean - math.log(1.005)) / diff_sdev)) > 0.01:
+    print(f"p(speedup > .5%) = {p05:>7.4f}")
 
 cpu = str()
 if os.path.exists("/proc/cpuinfo"):
