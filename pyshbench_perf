@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 import subprocess
-import select
+import threading
 import re
 import statistics
 import math
@@ -8,6 +8,7 @@ import sys
 import platform
 import os.path
 import psutil
+import random
 from time import sleep, perf_counter
 
 def erf_inv(x):
@@ -32,9 +33,6 @@ def rightstr(s, l):
     else:
         return s
 
-def parse_cycles(out):
-    return int( RE_CYCLES.search(out).group(1).replace(',', '') )
-
 def stats(base, test, diff):
     runs = len(base)
     assert len(test) == runs == len(diff)
@@ -46,9 +44,6 @@ def stats(base, test, diff):
     test_sdev = statistics.stdev(test, test_mean) / math.sqrt(runs)
     diff_sdev = statistics.stdev(diff, diff_mean) / math.sqrt(runs)
     return (base_mean, base_sdev), (test_mean, test_sdev), (diff_mean, diff_sdev)
-
-RE_CYCLES = re.compile(r"([0-9,]*)\s+cpu_core/cpu-cycles")
-RE_NODES = re.compile(r"^Nodes searched\s*: (\d+)", re.MULTILINE)
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -98,19 +93,84 @@ elif spd_nodes == 'ltc':
 else:
     raise ValueError(f'unknown time control {spd_nodes}')
 
+RE_CYCLES = re.compile(r"^\s*([0-9,]*)\s+cpu_core/cpu-cycles", re.MULTILINE)
+RE_MIGRATIONS = re.compile(r"([0-9,]*)\s+cpu-migrations")
+RE_CONTEXT = re.compile(r"([0-9,]*)\s+context-switches")
+RE_NODES = re.compile(r"^Nodes searched\s*: (\d+)", re.MULTILINE)
+
+class PerfdEngine:
+    def __init__(self, path, cpuset):
+        ctrl_r, ctrl_w = os.pipe()
+        ack_r, ack_w = os.pipe()
+
+        self.perf = subprocess.Popen(
+            ["perf", "stat", "--delay=-1", "--control", f"fd:{ctrl_r},{ack_w}",
+             "taskset", "-c", ','.join(map(str, cpuset)),
+             path],
+            stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE,
+            encoding='utf8', pass_fds=(ctrl_r, ack_w))
+        # close the ends of the pipes that are for perf
+        os.close(ctrl_r)
+        os.close(ack_w)
+
+        self.ctrl_pipe = os.fdopen(ctrl_w, 'w')
+        self.ack_pipe = os.fdopen(ack_r, 'r')
+        self.stdin = self.perf.stdin
+        self.stdout = self.perf.stdout
+        self.stderr = self.perf.stderr
+        self.err = ''
+
+    def setup_wait(self):
+        assert(self.stdout.readline().startswith('Stockfish'))
+        self.stdin.write("uci\n")
+        self.stdin.flush()
+        # this blocks until the engine is ready
+        line = None
+        while line != 'uciok':
+            line = self.stdout.readline().strip()
+
+        # now we start recording
+        self.ctrl_pipe.write('enable\n')
+        self.ctrl_pipe.flush()
+        # block until perf is ready
+        assert(self.ack_pipe.readline().strip() == "ack")
+
+    def start_bench(self, cmd):
+        def bg_drain():
+            _, self.err = self.perf.communicate(cmd + '\nquit\n')
+
+        self._drain_thread = threading.Thread(target=bg_drain)
+        self._drain_thread.start()
+
+    def read_stats(self) -> tuple[int, int]: # blocking!
+        self._drain_thread.join() # blocking
+        nodes = int(RE_NODES.search(self.err).group(1))
+        cycles = int( RE_CYCLES.search(self.err).group(1).replace(',', '') )
+
+        # if int(m := re_migrations.search(self.err).group(1)):
+        #     print(f'migrations: {m}')
+        # if int(m := re_context.search(self.err).group(1)):
+        #     print(f'context-sw: {m}')
+        return nodes, cycles
+
+class NoiseGen: # for testing stats
+    freq = 4e9
+    nps_scale = 1_000_000
+    nodes = 2_500_000
+    def __init__(self, mean, stdev):
+        self.mean = mean
+        self.stdev = stdev
+
+    def setup_wait(self): pass
+
+    def start_bench(self, cmd): pass
+
+    def read_stats(self) -> tuple[int, int]: # blocking!
+        scale = self.nodes / self.nps_scale * self.freq
+        return self.nodes, int(random.gauss(scale * self.mean, scale * self.stdev))
+
+
 print(f'command: {cmd}')
-
-def start_engine(path):
-    return subprocess.Popen(
-        [path],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        encoding="utf8"
-    )
-
-def and_affinity(pid, cpuset):
-    proc = psutil.Process(pid)
-    proc.cpu_affinity(set(cpuset) & set(proc.cpu_affinity()))
-
 warned = False
 sample_no = 0
 try:
@@ -125,74 +185,32 @@ try:
                   end='', flush=True)
 
         # Start both processes. This is non-blocking.
-        base_proc = start_engine(sys.argv[1])
-        and_affinity(base_proc.pid, cpuset[sample_no % 2])
-
-        test_proc = start_engine(sys.argv[2])
-        and_affinity(test_proc.pid, cpuset[(sample_no + 1) % 2])
+        base_proc = PerfdEngine(sys.argv[1], cpuset[sample_no % 2])
+        test_proc = PerfdEngine(sys.argv[2], cpuset[(sample_no + 1) % 2])
 
         # send uci and wait for each engine to reply "uciok"
         for p in (base_proc, test_proc)[:: (-1)**( sample_no%4 in {0, 3} )]:
-            p.stdin.write("uci\n")
-            p.stdin.flush()
+            p.setup_wait()
 
-        pending = {base_proc.stdout, test_proc.stdout}
-        while pending:
-            r, _, _ = select.select(list(pending), [], [])
-            for f in r:
-                line = f.readline() # it seems like readline() is ok, but readlines() is not
-                if line.startswith('id name'):
-                    pending.remove(f)
-            sleep(0.001)
+        order = (-1)**(sample_no % 4 in {0, 1})
+        first, second = (base_proc, test_proc)[::order]
 
-
-        perfs = [
-            subprocess.Popen(["perf", "stat", '-p', str(proc.pid)],
-                             stderr=subprocess.PIPE, encoding='utf8')
-            for proc in (base_proc, test_proc)
-        ]
-        sleep(0.3)
-
-        def start(proc):
-            proc.stdin.write(cmd + '\nquit\n')
-            proc.stdin.flush()
-
-        # run bench
+        # start bench
+        first.start_bench(cmd)
+        second.start_bench(cmd)
         # then wait for processes to finish ...
-        if sample_no % 4 in {0, 1}:
-            start(test_proc)
-            start(base_proc)
-            # whichever process comes second here is falsely shown to have higher nodes per cycle, which is why we need to alternate
-            _, out_t = test_proc.communicate()
-            _, out_b = base_proc.communicate()
-        else:
-            start(base_proc)
-            start(test_proc)
-            _, out_b = base_proc.communicate()
-            _, out_t = test_proc.communicate()
+        (base_n, base_c), (test_n, test_c) = (first.read_stats(), second.read_stats())[::order]
+        base.append(int(base_n / base_c * 1e9))
+        test.append(int(test_n / test_c * 1e9))
 
-
-        # ... and grep nps results in their stderr output
-        nodes = [int(RE_NODES.search(out).group(1)) for out in (out_b, out_t)]
-        if nodes[1] == 0:
-            nodes[1] = nodes[0]
-        if not warned and nodes[0] != nodes[1]:
+        if test_n == 0:
+            test_n = base_n
+        if not warned and base_n != test_n:
             print("WARN:  signature differs")
             warned = True
 
-        for p, stat, nd in list(zip(perfs, (base, test), nodes)):
-            p.send_signal(2)  # make perf print its output
-            perf = p.stderr.read()
-            cycles = parse_cycles(perf)
-            stat.append(int(nd / cycles * 1e9))
-
         diff.append(math.log(test[sample_no] / base[sample_no]))
-        # if spd_nodes and sample_no == 0:
-        #     for name, out in (('base', stats_b), ('test', stats_t)):
-        #         start = out.find('TT size [MiB]')
-        #         lines = out[start:].split('\n')
-        #         print(f'output from {name}:')
-        #         print('\n'.join('  ' + x for x in lines[:6]))
+
 
         print("\r" + " " * 45, end='') # clear previous line
         def format_diff(num):
@@ -221,12 +239,16 @@ except KeyboardInterrupt:
 
 (base_mean, base_sdev), (test_mean, test_sdev), (diff_mean, diff_sdev) = stats(base, test, diff)
 try:
-    from scipy.stats import t
-    CDF = t(sample_no - 1).cdf
-    Quantile = t(sample_no - 1).ppf
+    # from scipy.stats import t
+    # CDF = t(sample_no - 1).cdf
+    # Quantile = t(sample_no - 1).ppf
+    from scipy.special import stdtr, stdtrit
+    CDF = lambda x: stdtr(sample_no - 1, x)
+    Quantile = lambda x: stdtrit(sample_no - 1, x)
     comment = "[95% CI; t-statistic]"
+    use_t = True
 except ImportError:
-    t = None
+    use_t = False
     comment = "[95% CI]"
 
 if len(diff) > 2 and len(diff) % 2 == 0:
@@ -235,11 +257,10 @@ if len(diff) > 2 and len(diff) % 2 == 0:
     diff2_sdev = statistics.stdev(diff[1::2]) / math.sqrt(n)
     diff_sdev = math.sqrt(diff1_sdev**2 + diff2_sdev**2) / 2
     # sdev2_ = statistics.stdev([(x+y)/2 for x, y in zip(diff[::2], diff[1::2])]) / math.sqrt(len(diff) / 2)
-    if t is not None:
-        CDF = t(sample_no - 2).cdf
-        Quantile = t(sample_no - 2).ppf
+    if use_t:
+        CDF = lambda x: stdtr(sample_no - 2, x)
+        Quantile = lambda x: stdtrit(sample_no - 2, x)
 
-n = "hi"
 
 print(f"\nResult of {sample_no} runs (cycles)\n===========================")
 print("base ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[1],15), round(base_mean), round(Quantile(0.975) * base_sdev)))
