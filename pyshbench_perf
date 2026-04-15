@@ -245,7 +245,7 @@ try:
     from scipy.special import stdtr, stdtrit
     CDF = lambda x: stdtr(sample_no - 1, x)
     Quantile = lambda x: stdtrit(sample_no - 1, x)
-    comment = "[95% CI; t-statistic]"
+    comment = "[95% CI; t-test]"
     use_t = True
 except ImportError:
     use_t = False
@@ -262,21 +262,22 @@ if len(diff) > 2 and len(diff) % 2 == 0:
         Quantile = lambda x: stdtrit(sample_no - 2, x)
 
 
-print(f"\nResult of {sample_no} runs (cycles)\n===========================")
-print("base ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[1],15), round(base_mean), round(Quantile(0.975) * base_sdev)))
-print("test ({:<15s}) = {:>10n}  +/- {:n}".format(rightstr(sys.argv[2],15), round(test_mean), round(Quantile(0.975) * test_sdev)))
+print(f"\nResult of {sample_no} runs (counting nodes/1B cycles)")
+print("=" * 45)
+print("base ({:<18s}) = {:>7n} +/- {:n}".format(rightstr(sys.argv[1],18), round(base_mean), round(Quantile(0.975) * base_sdev)))
+print("test ({:<18s}) = {:>7n} +/- {:n}".format(rightstr(sys.argv[2],18), round(test_mean), round(Quantile(0.975) * test_sdev)))
 # print("{:22s} = {:>+10n}  +/- {:n}".format("diff", round(diff_mean), round(Quantile(0.975) * diff_sdev)))
 
 speedup = math.exp(diff_mean) - 1
 sp_unc = math.exp(diff_mean) * diff_sdev
-print(f"speedup %              =   {100 * speedup:>+8.2f}  +/- {100 * sp_unc * Quantile(0.975):.2f}")
-print(" " * 25 + comment)
+print(f"speedup %                 =   {100 * speedup:>+5.2f} +/- {100 * sp_unc * Quantile(0.975):.2f}")
+print(" " * 29 + comment)
 print()
 
-print(f"p(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
+print(f"likelihood(speedup > 0)   = {CDF(diff_mean / diff_sdev):>7.4f}")
 # this number is basically p-value. If there is not speedup, the probability of this saying p(...) > 1 - p is less than p
 if (p05 := CDF((diff_mean - math.log(1.005)) / diff_sdev)) > 0.01 or speedup > 1.025:
-    print(f"p(speedup > .5%) = {p05:>7.4f}")
+    print(f"likelyhood(speedup > .5%) = {p05:>7.4f}")
 
 cpu = str()
 if os.path.exists("/proc/cpuinfo"):
